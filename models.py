@@ -1,6 +1,8 @@
 import torch
+import torch.nn.functional as F
 import pytorch_lightning as pl
-import evaluate
+import torchmetrics as metrics
+from torchmetrics import text
 from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
 from transformers import (
     BertLMHeadModel,
@@ -21,15 +23,24 @@ from transformers import (
     AdamW,
 )
 
-from metrics import perplexity, accuracy
-
-
-class DummyTokenizer:
-    def __init__(self):
-        pass
-
-    def tokenize(self, x):
-        return x
+MODEL_DICT = {
+    "bert": {
+        "dialogue": "bert-base-uncased",
+        "qa": "deepset/bert-base-cased-squad2",
+    },
+    "opt": {
+        "dialogue": "facebook/opt-350m",
+        "qa": "facebook/opt-350m",
+    },
+    "gpt2": {
+        "dialogue": "gpt2",
+        "qa": "gpt2",
+    },
+    "longformer": {
+        "dialogue": "allenai/longformer-base-4096",
+        "qa": "allenai/longformer-large-4096-finetuned-triviaqa",
+    },
+}
 
 
 class TransformerModel(pl.LightningModule):
@@ -101,14 +112,17 @@ class TransformerModel(pl.LightningModule):
                 )
                 self.tokenizer = LongformerTokenizer.from_pretrained("allenai/longformer-large-4096-finetuned-triviaqa")
 
+        self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
         self.learning_rate = learning_rate
         self.vocab_size = vocab_size
         self.ten_logger = ten_logger
 
-        self.metrics = {
-            "rogue": evaluate.load("rouge"),
-            "perplexity": perplexity,
-            "accuracy": accuracy,
+        self.test_metrics = {
+            "rouge": text.rouge.ROUGEScore(use_stemmer=True, tokenizer=self.tokenizer),
+            "perplexity": text.perplexity.Perplexity(),
+            "bert": text.bert.BERTScore(),
+            "distance": metrics.ExtendedEditDistance(),
+            "divergence": text.infolm.InfoLM(idf=False),
         }
 
     def forward(self, **inputs):
@@ -125,45 +139,39 @@ class TransformerModel(pl.LightningModule):
             global_attention_mask[:, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]] = 1
             return self.model(global_attention_mask=global_attention_mask, **inputs)
 
+        if self.model_name == "opt":
+            del inputs["token_type_ids"]
+
         return self.model(**inputs)
 
     def training_step(self, batch, batch_idx):
         outputs = self(**batch)
+
+        self.log("loss", outputs["loss"], on_epoch=True, on_step=True)
 
         return {"loss": outputs["loss"]}
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         outputs = self(**batch)
 
-        return {
-            "val_loss": outputs["loss"],
-            "labels": batch["labels"],
-            "logits": outputs["logits"],
-        }
+        # self.log(self.perplexity(batch), on_epoch=True, on_step=True)
 
-    def validation_epoch_end(self, outputs):
-        logits = torch.cat([x["logits"] for x in outputs]).detach().cpu()
-        labels = torch.cat([x["labels"] for x in outputs]).detach().cpu()
-        loss = torch.stack([x["val_loss"] for x in outputs]).mean()
-        self.log("val_loss", loss, prog_bar=True)
+        self.log("val_loss", outputs["loss"], on_epoch=True, on_step=True)
 
-        # convert logits to tokens using softmax activation
-        predictions = torch.softmax(logits, dim=-1)
-        predictions = torch.argmax(predictions, dim=-1)
+        return {"val_loss": outputs["loss"]}
 
-        self.log_dict(self.metrics["accuracy"](predictions, labels), prog_bar=True)
-        self.log_dict(
-            self.metrics["perplexity"](predictions.type(torch.FloatTensor), labels.type(torch.FloatTensor)),
-            prog_bar=True,
-        )
-        # self.log_dict(
-        #    self.metrics["rogue"].compute(
-        #        predictions=self.decode(predictions),
-        #        references=self.decode(labels),
-        #        tokenizer=self.tokenizer,
-        #    ),
-        #    prog_bar=True,
-        # )
+    def perplexity(self, batch):
+        tensor_input = batch["input_ids"]
+        loss = 0
+        for sentence in tensor_input:
+            repeat_input = sentence.repeat(sentence.size(-1) - 2, 1).to(self.device)
+            mask = torch.ones(sentence.size(-1) - 1).diag(1)[:-2].to(self.device)
+            masked_input = repeat_input.masked_fill(mask == 1, self.tokenizer.mask_token_id)
+            labels = repeat_input.masked_fill(masked_input != self.tokenizer.mask_token_id, -100)
+            with torch.inference_mode():
+                loss += self.model(masked_input, labels=labels).loss.item()
+
+        return torch.exp(loss)
 
     def configure_optimizers(self):
         optimizer = AdamW(self.parameters(), lr=self.learning_rate)
@@ -174,14 +182,12 @@ class TransformerModel(pl.LightningModule):
 
 
 if __name__ == "__main__":
-    model = TransformerModel(32786, model="bert", task="dialogue")
+    model = TransformerModel(32786, model="bert")
+    model = TransformerModel(32786, model="opt")
+    model = TransformerModel(32786, model="longformer")
+    model = TransformerModel(32786, model="gpt2")
+
     model = TransformerModel(32786, model="bert", task="qa")
-
-    model = TransformerModel(32786, model="opt", task="dialogue")
     model = TransformerModel(32786, model="opt", task="qa")
-
-    model = TransformerModel(32786, model="longformer", task="dialogue")
     model = TransformerModel(32786, model="longformer", task="qa")
-
-    model = TransformerModel(32786, model="gpt2", task="dialogue")
     model = TransformerModel(32786, model="gpt2", task="qa")
